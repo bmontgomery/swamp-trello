@@ -1,0 +1,15 @@
+manifestVersion: 1
+name: "@bmonty/trello"
+version: "2026.10.24.1"
+license: MIT
+description: "Watch Trello lanes and work cards from swamp workflows: read cards with comments, checklists, attachments, and activity history; move cards, comment, attach files, and manage labels and checklists."
+repository: https://github.com/bmontgomery/swamp-trello
+
+models:
+  - trello/trello.ts
+additionalFiles:
+  - README.md
+  - LICENSE
+labels:
+  - trello
+  - project-management
