@@ -157,6 +157,9 @@ export const CardMoveSchema = z.object({
 /** Result of `addComment`. */
 export const PostedCommentSchema = CommentSchema.extend({
   cardId: z.string(),
+  existing: z.boolean().describe(
+    "True when `skipIfContains` matched an earlier comment and nothing was posted.",
+  ),
 });
 
 /** Result of `attachFile`. */
@@ -1021,9 +1024,12 @@ export const model = {
         text: z.string().min(1).max(16384).describe(
           "Comment text; Trello renders markdown. Max 16384 characters.",
         ),
+        skipIfContains: z.string().min(1).optional().describe(
+          "Don't post if an existing comment contains this text; makes the call safe to retry.",
+        ),
       }),
       execute: async (
-        args: { card: string; text: string },
+        args: { card: string; text: string; skipIfContains?: string },
         ctx: MethodContext,
       ): Promise<{ dataHandles: Array<{ name: string }> }> => {
         const client = clientFor(ctx);
@@ -1033,7 +1039,22 @@ export const model = {
           args.card,
           ctx.signal,
         );
-        const action = await client.send<RawCommentAction>(
+        let action: RawCommentAction | undefined;
+        if (args.skipIfContains) {
+          const marker = args.skipIfContains;
+          const comments = await client.get<RawCommentAction[]>(
+            `/cards/${ref.id}/actions`,
+            {
+              filter: "commentCard",
+              limit: "1000",
+              memberCreator_fields: "username",
+            },
+            ctx.signal,
+          );
+          action = comments.find((c) => c.data.text.includes(marker));
+        }
+        const existing = action !== undefined;
+        action ??= await client.send<RawCommentAction>(
           "POST",
           `/cards/${ref.id}/actions/comments`,
           { text: args.text },
@@ -1049,6 +1070,7 @@ export const model = {
             authorId: action.idMemberCreator,
             authorUsername: action.memberCreator?.username ?? null,
             text: action.data.text,
+            existing,
           },
         );
         return { dataHandles: [handle] };

@@ -651,3 +651,28 @@ Deno.test("toCardAction keeps type, author, and raw data", () => {
     },
   );
 });
+
+Deno.test("addComment with skipIfContains reuses a matching comment instead of posting", async () => {
+  await withFakeTrello({
+    ...board,
+    ...cardIn("ready"),
+    "GET /cards/c1/actions": () => [
+      {
+        id: "a1",
+        date: "t",
+        idMemberCreator: "bot",
+        data: { text: "Picked up `ai-pipeline:claimed`" },
+      },
+    ],
+  }, async (calls) => {
+    const { ctx, written } = fakeCtx();
+    await methods.addComment.execute({
+      card: "c1",
+      text: "Picked up again `ai-pipeline:claimed`",
+      skipIfContains: "ai-pipeline:claimed",
+    }, ctx);
+    assertEquals(calls.some((c) => c.method === "POST"), false);
+    assertEquals(written[0].name, "comment-a1");
+    assertEquals(written[0].data.existing, true);
+  });
+});
