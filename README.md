@@ -54,7 +54,7 @@ Write (each refuses cards that are not on the configured board):
 | Method              | Arguments                                                                               | Writes                    |
 | ------------------- | --------------------------------------------------------------------------------------- | ------------------------- |
 | `moveCard`          | `card`, `list` (id or name), `position?` (`top`/`bottom`)                               | `move-<cardId>`           |
-| `addComment`        | `card`, `text` (markdown, max 16384 chars)                                              | `comment-<actionId>`      |
+| `addComment`        | `card`, `text` (markdown, max 16384 chars), `skipIfContains?`                         | `comment-<actionId>`      |
 | `attachFile`        | `card`, `name`, `content` or `path`, `mimeType?` (default `text/markdown`), `replaceExisting?` | `upload-<attachmentId>`   |
 | `updateLabels`      | `card`, `add?`, `remove?` (label names or ids)                                          | `labels-<cardId>`         |
 | `addChecklistItems` | `card`, `checklist` (name; created if missing), `items`, `skipExisting?` (default true) | `checklist-<checklistId>` |
@@ -62,8 +62,12 @@ Write (each refuses cards that are not on the configured board):
 
 Writes are safe to retry where Trello allows it: moving a card to the lane it
 is already in, adding a label it already has, or adding checklist items that
-already exist changes nothing. `addComment` is the exception; record the
-returned `comment-<actionId>` if you need to avoid double-posting.
+already exist changes nothing. `addComment` is retry-safe when you pass
+`skipIfContains`: put a unique marker in the text, and if any comment on the
+card already contains it, that comment is recorded (`existing: true`) instead
+of posting again. Trello returns at most the newest 1000 comments, so a marker
+older than that is missed; `getCard` sets `commentsTruncated` and
+`getCardActions` sets `truncated` when that limit was reached.
 `attachFile` with `replaceExisting` uploads first and only then deletes older
 same-named attachments, so the card never loses the file mid-update.
 

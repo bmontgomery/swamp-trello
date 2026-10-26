@@ -4,6 +4,7 @@ import {
   assertThrows,
 } from "jsr:@std/assert@1.0.13";
 import {
+  apiUrl,
   type CardDetail,
   customFieldValue,
   downloadAttachments,
@@ -38,9 +39,9 @@ Deno.test("resolveList rejects ambiguous and unknown names", () => {
 });
 
 Deno.test("resolveMember matches id or username with optional @", () => {
-  const members = [{ id: "m1", username: "bmontyclaudebot" }];
-  assertEquals(resolveMember(members, "m1").username, "bmontyclaudebot");
-  assertEquals(resolveMember(members, "@BmontyClaudeBot").id, "m1");
+  const members = [{ id: "m1", username: "example-bot" }];
+  assertEquals(resolveMember(members, "m1").username, "example-bot");
+  assertEquals(resolveMember(members, "@Example-Bot").id, "m1");
   assertThrows(
     () => resolveMember(members, "someone"),
     Error,
@@ -151,6 +152,7 @@ Deno.test("toCardDetail sorts comments oldest-first and checklist items by pos",
   assertEquals(detail.labels, ["red", "Bug"]);
   assertEquals(detail.memberUsernames, ["bot"]);
   assertEquals(detail.attachments, []);
+  assertEquals(detail.commentsTruncated, false);
 });
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -389,7 +391,7 @@ function fakeCtx() {
       createFileWriter: () => ({
         writeAll: () => Promise.resolve({ name: "f" }),
       }),
-      logger: { info: () => {} },
+      logger: { info: () => {}, warning: () => {} },
     },
   };
 }
@@ -482,7 +484,7 @@ Deno.test("addComment sends text in the body and records the action id", async (
       id: "a9",
       date: "2026-10-24T00:00:00Z",
       idMemberCreator: "bot",
-      memberCreator: { username: "bmontyclaudebot" },
+      memberCreator: { username: "example-bot" },
       data: { text: (call.body as URLSearchParams).get("text") },
     }),
   }, async (calls) => {
@@ -495,7 +497,7 @@ Deno.test("addComment sends text in the body and records the action id", async (
     assertEquals(post.path, "/cards/c1/actions/comments");
     assertEquals(written[0].name, "comment-a9");
     assertEquals(written[0].data.text, "**Design v1** ready");
-    assertEquals(written[0].data.authorUsername, "bmontyclaudebot");
+    assertEquals(written[0].data.authorUsername, "example-bot");
   });
 });
 
@@ -675,4 +677,21 @@ Deno.test("addComment with skipIfContains reuses a matching comment instead of p
     assertEquals(written[0].name, "comment-a1");
     assertEquals(written[0].data.existing, true);
   });
+});
+
+Deno.test("apiUrl accepts plain ids and rejects path tricks", () => {
+  assertEquals(
+    apiUrl("/cards/abc123/actions").toString(),
+    "https://api.trello.com/1/cards/abc123/actions",
+  );
+  for (
+    const bad of [
+      "/cards/../boards/x",
+      "/cards/a%2F..",
+      "/cards/a b",
+      "/cards/",
+    ]
+  ) {
+    assertThrows(() => apiUrl(bad), Error, "Invalid Trello id");
+  }
 });

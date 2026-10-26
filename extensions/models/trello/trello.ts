@@ -13,6 +13,21 @@ import { z } from "npm:zod@4";
 
 const TRELLO_API = "https://api.trello.com/1";
 
+/** Trello returns at most this many actions per request (newest first). */
+export const MAX_ACTIONS = 1000;
+
+/**
+ * Every path segment must be a plain Trello id, short link, or resource name.
+ * Ids come from method arguments; rejecting anything else stops `../` from
+ * reaching another resource and skipping the board check.
+ */
+export function apiUrl(path: string): URL {
+  if (!/^(\/[A-Za-z0-9]+)+$/.test(path)) {
+    throw new Error(`Invalid Trello id in request path: ${path}`);
+  }
+  return new URL(`${TRELLO_API}${path}`);
+}
+
 /** Global arguments shared by every method. */
 export const GlobalArgsSchema = z.object({
   apiKey: z.string().min(1).meta({ sensitive: true }).describe(
@@ -137,6 +152,9 @@ export const CardDetailSchema = z.object({
   customFields: z.array(CustomFieldValueSchema),
   attachments: z.array(AttachmentSchema),
   comments: z.array(CommentSchema),
+  commentsTruncated: z.boolean().describe(
+    "True when the card has more comments than Trello returns (1000); the oldest are missing.",
+  ),
   fetchedAt: z.string(),
 });
 
@@ -199,6 +217,9 @@ export const CardActionsSchema = z.object({
   types: z.array(z.string()),
   since: z.string().nullable(),
   actions: z.array(CardActionSchema),
+  truncated: z.boolean().describe(
+    "True when Trello's 1000-action limit was reached; the oldest are missing.",
+  ),
   fetchedAt: z.string(),
 });
 
@@ -224,7 +245,7 @@ export class TrelloClient {
     params: Record<string, string> = {},
     signal?: AbortSignal,
   ): Promise<T> {
-    const url = new URL(`${TRELLO_API}${path}`);
+    const url = apiUrl(path);
     for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
     const res = await this.request(url, "application/json", path, signal);
     return await res.json() as T;
@@ -241,7 +262,7 @@ export class TrelloClient {
     signal?: AbortSignal,
   ): Promise<T> {
     const res = await this.request(
-      new URL(`${TRELLO_API}${path}`),
+      apiUrl(path),
       "application/json",
       path,
       signal,
@@ -512,6 +533,7 @@ export function toCardDetail(
         text: c.data.text,
       }))
       .sort((a, b) => a.date.localeCompare(b.date)),
+    commentsTruncated: comments.length >= MAX_ACTIONS,
     fetchedAt,
   };
 }
@@ -540,7 +562,7 @@ export async function fetchCardDetail(
     ),
     client.get<RawCommentAction[]>(`/cards/${card.id}/actions`, {
       filter: "commentCard",
-      limit: "1000",
+      limit: String(MAX_ACTIONS),
       memberCreator_fields: "username",
     }, signal),
   ]);
@@ -603,7 +625,10 @@ interface MethodContext {
   writeResource: WriteResource;
   createFileWriter: CreateFileWriter;
   signal?: AbortSignal;
-  logger: { info: (msg: string, props?: Record<string, unknown>) => void };
+  logger: {
+    info: (msg: string, props?: Record<string, unknown>) => void;
+    warning: (msg: string, props?: Record<string, unknown>) => void;
+  };
 }
 
 function clientFor(ctx: MethodContext): TrelloClient {
@@ -767,7 +792,7 @@ const DownloadArgs = {
 /** Model definition for `@bmonty/trello`. */
 export const model = {
   type: "@bmonty/trello",
-  version: "2026.10.24.1",
+  version: "2026.10.26.1",
   globalArguments: GlobalArgsSchema,
   resources: {
     boardLists: {
@@ -1046,12 +1071,18 @@ export const model = {
             `/cards/${ref.id}/actions`,
             {
               filter: "commentCard",
-              limit: "1000",
+              limit: String(MAX_ACTIONS),
               memberCreator_fields: "username",
             },
             ctx.signal,
           );
           action = comments.find((c) => c.data.text.includes(marker));
+          if (!action && comments.length >= MAX_ACTIONS) {
+            ctx.logger.warning(
+              "Card {card} has more than {max} comments; an older comment with the marker would be missed",
+              { card: ref.id, max: MAX_ACTIONS },
+            );
+          }
         }
         const existing = action !== undefined;
         action ??= await client.send<RawCommentAction>(
@@ -1375,7 +1406,7 @@ export const model = {
         const client = clientFor(ctx);
         const params: Record<string, string> = {
           filter: args.types.join(","),
-          limit: "1000",
+          limit: String(MAX_ACTIONS),
           memberCreator_fields: "username",
         };
         if (args.since) params.since = args.since;
@@ -1400,6 +1431,7 @@ export const model = {
             types: args.types,
             since: args.since ?? null,
             actions,
+            truncated: raw.length >= MAX_ACTIONS,
             fetchedAt: new Date().toISOString(),
           },
         );
