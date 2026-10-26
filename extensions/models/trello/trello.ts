@@ -229,7 +229,121 @@ export type FetchFn = (
   init?: RequestInit,
 ) => Promise<Response>;
 
-/** Thin Trello REST client: auth header, JSON parsing, 429 backoff. */
+/** The longest the client waits between retries, whatever `Retry-After` says. */
+export const MAX_RETRY_DELAY_MS = 60_000;
+
+/** Statuses worth retrying for reads, updates, and deletes; POST retries only on 429. */
+const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
+
+/** A failed Trello call. `status` is null for network errors. */
+export class TrelloError extends Error {
+  /** Create an error for a failed call. */
+  constructor(message: string, readonly status: number | null) {
+    super(message);
+    this.name = "TrelloError";
+  }
+}
+
+/** Called before each retry, so the caller can log it. */
+export type RetryListener = (
+  info: { method: string; path: string; reason: string; delayMs: number },
+) => void;
+
+/** Delay before retry `attempt` (0-based): `Retry-After` if given, else exponential; capped. */
+export function retryDelayMs(
+  attempt: number,
+  retryAfter: string | null,
+): number {
+  const seconds = Number(retryAfter);
+  const ms = seconds > 0 ? seconds * 1000 : 1000 * 2 ** attempt;
+  return Math.min(ms, MAX_RETRY_DELAY_MS);
+}
+
+/** Wait `ms`, or reject as soon as `signal` aborts. */
+export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal!.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+const RawListShape = z.object({ id: z.string(), name: z.string() });
+const RawCardShape = z.object({
+  id: z.string(),
+  shortLink: z.string(),
+  name: z.string(),
+  idBoard: z.string(),
+  idList: z.string(),
+});
+const RawCommentActionShape = z.object({
+  id: z.string(),
+  date: z.string(),
+  data: z.object({ text: z.string() }),
+});
+
+/** Required fields of the responses the extension reads, for `get` and `send`. */
+export const Shapes = {
+  list: RawListShape,
+  lists: z.array(RawListShape),
+  card: RawCardShape,
+  cardSummaries: z.array(z.object({
+    id: z.string(),
+    shortLink: z.string(),
+    name: z.string(),
+    idList: z.string(),
+    idMembers: z.array(z.string()),
+    labels: z.array(
+      z.object({ name: z.string(), color: z.string().nullable() }),
+    ),
+  })),
+  comment: RawCommentActionShape,
+  comments: z.array(RawCommentActionShape),
+  actions: z.array(
+    z.object({ id: z.string(), type: z.string(), date: z.string() }),
+  ),
+  attachment: z.object({ id: z.string(), name: z.string() }),
+  id: z.object({ id: z.string() }),
+  cardRef: z.object({ id: z.string(), idBoard: z.string() }),
+  checkItem: z.object({ idChecklist: z.string() }),
+};
+
+function checkShape<T>(
+  json: unknown,
+  shape: z.ZodType | undefined,
+  method: string,
+  path: string,
+  status: number,
+): T {
+  if (shape) {
+    const checked = shape.safeParse(json);
+    if (!checked.success) {
+      throw new TrelloError(
+        `Trello ${method} ${path} returned an unexpected response: ${
+          checked.error.issues.slice(0, 3).map((i) =>
+            `${i.path.join(".") || "(root)"}: ${i.message}`
+          ).join("; ")
+        }`,
+        status,
+      );
+    }
+  }
+  return json as T;
+}
+
+/**
+ * Thin Trello REST client: auth header, JSON parsing, retries with backoff.
+ * Reads, updates, and deletes are retried on 429, 5xx, and network errors.
+ * Creates (POST) are retried only on 429, which means the request was not
+ * applied, so a retry never creates twice.
+ */
 export class TrelloClient {
   /** Create a client for the given credentials. */
   constructor(
@@ -237,18 +351,20 @@ export class TrelloClient {
     private readonly apiToken: string,
     private readonly fetchFn: FetchFn = fetch,
     private readonly maxRetries = 3,
+    private readonly onRetry: RetryListener = () => {},
   ) {}
 
-  /** GET a Trello API path with query params and return parsed JSON. */
+  /** GET a Trello API path with query params; with `shape`, check the response. */
   async get<T>(
     path: string,
     params: Record<string, string> = {},
     signal?: AbortSignal,
+    shape?: z.ZodType,
   ): Promise<T> {
     const url = apiUrl(path);
     for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
     const res = await this.request(url, "application/json", path, signal);
-    return await res.json() as T;
+    return checkShape<T>(await res.json(), shape, "GET", path, res.status);
   }
 
   /**
@@ -260,6 +376,7 @@ export class TrelloClient {
     path: string,
     body: Record<string, string> | FormData = {},
     signal?: AbortSignal,
+    shape?: z.ZodType,
   ): Promise<T> {
     const res = await this.request(
       apiUrl(path),
@@ -269,7 +386,7 @@ export class TrelloClient {
       method,
       body instanceof FormData ? body : new URLSearchParams(body),
     );
-    return await res.json() as T;
+    return checkShape<T>(await res.json(), shape, method, path, res.status);
   }
 
   /**
@@ -309,34 +426,76 @@ export class TrelloClient {
     body?: URLSearchParams | FormData,
   ): Promise<Response> {
     for (let attempt = 0;; attempt++) {
-      const res = await this.fetchFn(url.toString(), {
-        method,
-        body,
-        headers: {
-          Accept: accept,
-          // Header auth keeps the token out of URLs and request logs.
-          Authorization:
-            `OAuth oauth_consumer_key="${this.apiKey}", oauth_token="${this.apiToken}"`,
-        },
-        signal,
-      });
-      if (res.status === 429 && attempt < this.maxRetries) {
+      let res: Response;
+      try {
+        res = await this.fetchFn(url.toString(), {
+          method,
+          body,
+          headers: {
+            Accept: accept,
+            // Header auth keeps the token out of URLs and request logs.
+            Authorization:
+              `OAuth oauth_consumer_key="${this.apiKey}", oauth_token="${this.apiToken}"`,
+          },
+          signal,
+        });
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        if (
+          signal?.aborted || method === "POST" || attempt >= this.maxRetries
+        ) {
+          throw new TrelloError(
+            `Trello ${method} ${label} failed: network error: ${reason}`,
+            null,
+          );
+        }
+        await this.backoff(
+          attempt,
+          null,
+          `network error: ${reason}`,
+          method,
+          label,
+          signal,
+        );
+        continue;
+      }
+      const retryable = method === "POST"
+        ? res.status === 429
+        : RETRYABLE_STATUSES.has(res.status);
+      if (retryable && attempt < this.maxRetries) {
         await res.body?.cancel();
-        const retryAfter = Number(res.headers.get("Retry-After"));
-        const delayMs = retryAfter > 0
-          ? retryAfter * 1000
-          : 1000 * 2 ** attempt;
-        await new Promise((r) => setTimeout(r, delayMs));
+        await this.backoff(
+          attempt,
+          res.headers.get("Retry-After"),
+          `HTTP ${res.status}`,
+          method,
+          label,
+          signal,
+        );
         continue;
       }
       if (!res.ok) {
         const text = (await res.text()).slice(0, 300);
-        throw new Error(
+        throw new TrelloError(
           `Trello ${method} ${label} failed: ${res.status} ${text}`,
+          res.status,
         );
       }
       return res;
     }
+  }
+
+  private async backoff(
+    attempt: number,
+    retryAfter: string | null,
+    reason: string,
+    method: string,
+    path: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const delayMs = retryDelayMs(attempt, retryAfter);
+    this.onRetry({ method, path, reason, delayMs });
+    await sleep(delayMs, signal);
   }
 }
 
@@ -544,27 +703,42 @@ export async function fetchCardDetail(
   cardId: string,
   signal?: AbortSignal,
 ): Promise<CardDetail> {
-  const card = await client.get<RawCard>(`/cards/${cardId}`, {
-    fields:
-      "shortLink,name,desc,url,idBoard,idList,closed,idMembers,labels,due,dateLastActivity",
-    members: "true",
-    member_fields: "username",
-    checklists: "all",
-    attachments: "true",
-    customFieldItems: "true",
-  }, signal);
+  const card = await client.get<RawCard>(
+    `/cards/${cardId}`,
+    {
+      fields:
+        "shortLink,name,desc,url,idBoard,idList,closed,idMembers,labels,due,dateLastActivity",
+      members: "true",
+      member_fields: "username",
+      checklists: "all",
+      attachments: "true",
+      customFieldItems: "true",
+    },
+    signal,
+    Shapes.card,
+  );
   const [list, customFields, comments] = await Promise.all([
-    client.get<RawList>(`/lists/${card.idList}`, { fields: "name" }, signal),
+    client.get<RawList>(
+      `/lists/${card.idList}`,
+      { fields: "name" },
+      signal,
+      Shapes.list,
+    ),
     client.get<RawCustomField[]>(
       `/boards/${card.idBoard}/customFields`,
       {},
       signal,
     ),
-    client.get<RawCommentAction[]>(`/cards/${card.id}/actions`, {
-      filter: "commentCard",
-      limit: String(MAX_ACTIONS),
-      memberCreator_fields: "username",
-    }, signal),
+    client.get<RawCommentAction[]>(
+      `/cards/${card.id}/actions`,
+      {
+        filter: "commentCard",
+        limit: String(MAX_ACTIONS),
+        memberCreator_fields: "username",
+      },
+      signal,
+      Shapes.comments,
+    ),
   ]);
   return toCardDetail(
     card,
@@ -632,7 +806,17 @@ interface MethodContext {
 }
 
 function clientFor(ctx: MethodContext): TrelloClient {
-  return new TrelloClient(ctx.globalArgs.apiKey, ctx.globalArgs.apiToken);
+  return new TrelloClient(
+    ctx.globalArgs.apiKey,
+    ctx.globalArgs.apiToken,
+    fetch,
+    3,
+    (r) =>
+      ctx.logger.warning(
+        "Trello {method} {path} failed ({reason}); retrying in {delayMs} ms",
+        r,
+      ),
+  );
 }
 
 /** Card detail plus any attachment bytes, fetched but not yet persisted. */
@@ -710,10 +894,20 @@ async function cardOnBoard(
   signal?: AbortSignal,
 ): Promise<CardRef> {
   const [board, ref] = await Promise.all([
-    client.get<{ id: string }>(`/boards/${boardId}`, { fields: "id" }, signal),
-    client.get<CardRef>(`/cards/${card}`, {
-      fields: "idBoard,idList,idLabels",
-    }, signal),
+    client.get<{ id: string }>(
+      `/boards/${boardId}`,
+      { fields: "id" },
+      signal,
+      Shapes.id,
+    ),
+    client.get<CardRef>(
+      `/cards/${card}`,
+      {
+        fields: "idBoard,idList,idLabels",
+      },
+      signal,
+      Shapes.cardRef,
+    ),
   ]);
   if (ref.idBoard !== board.id) {
     throw new Error(
@@ -867,11 +1061,14 @@ export const model = {
         ctx: MethodContext,
       ): Promise<{ dataHandles: Array<{ name: string }> }> => {
         const { boardId } = ctx.globalArgs;
+        ctx.logger.info("Listing lanes on board {board}", { board: boardId });
         const lists = await clientFor(ctx).get<RawList[]>(
           `/boards/${boardId}/lists`,
           { filter: "open", fields: "name,closed,pos" },
           ctx.signal,
+          Shapes.lists,
         );
+        ctx.logger.info("Found {count} open lane(s)", { count: lists.length });
         const handle = await ctx.writeResource("boardLists", "board-lists", {
           boardId,
           lists: lists.map(({ id, name, closed, pos }) => ({
@@ -910,11 +1107,20 @@ export const model = {
       ): Promise<{ dataHandles: Array<{ name: string }> }> => {
         const client = clientFor(ctx);
         const { boardId } = ctx.globalArgs;
+        ctx.logger.info("Listing cards in {list}{member}", {
+          list: args.list,
+          member: args.member ? ` assigned to ${args.member}` : "",
+        });
         const [lists, members] = await Promise.all([
-          client.get<RawList[]>(`/boards/${boardId}/lists`, {
-            filter: "open",
-            fields: "name,closed,pos",
-          }, ctx.signal),
+          client.get<RawList[]>(
+            `/boards/${boardId}/lists`,
+            {
+              filter: "open",
+              fields: "name,closed,pos",
+            },
+            ctx.signal,
+            Shapes.lists,
+          ),
           client.get<RawMember[]>(`/boards/${boardId}/members`, {
             fields: "username",
           }, ctx.signal),
@@ -922,11 +1128,16 @@ export const model = {
         const list = resolveList(lists, args.list);
         const member = args.member ? resolveMember(members, args.member) : null;
         const usernames = new Map(members.map((m) => [m.id, m.username]));
-        const cards = await client.get<RawCard[]>(`/lists/${list.id}/cards`, {
-          filter: "open",
-          fields:
-            "shortLink,name,url,idList,idMembers,labels,dateLastActivity,due",
-        }, ctx.signal);
+        const cards = await client.get<RawCard[]>(
+          `/lists/${list.id}/cards`,
+          {
+            filter: "open",
+            fields:
+              "shortLink,name,url,idList,idMembers,labels,dateLastActivity,due",
+          },
+          ctx.signal,
+          Shapes.cardSummaries,
+        );
         const matching = cards
           .filter((c) => !member || c.idMembers.includes(member.id))
           .map((c) => ({
@@ -983,11 +1194,22 @@ export const model = {
         },
         ctx: MethodContext,
       ): Promise<{ dataHandles: Array<{ name: string }> }> => {
+        ctx.logger.info("Reading card {card}", { card: args.card });
         const card = await fetchCard(
           clientFor(ctx),
           args.card,
           args,
           ctx.signal,
+        );
+        ctx.logger.info(
+          'Card {card} "{name}" in {list}: {comments} comment(s), {attachments} attachment(s)',
+          {
+            card: card.detail.id,
+            name: card.detail.name,
+            list: card.detail.listName,
+            comments: card.detail.comments.length,
+            attachments: card.detail.attachments.length,
+          },
         );
         return { dataHandles: await persistCard(ctx, card) };
       },
@@ -1008,12 +1230,21 @@ export const model = {
       ): Promise<{ dataHandles: Array<{ name: string }> }> => {
         const client = clientFor(ctx);
         const { boardId } = ctx.globalArgs;
+        ctx.logger.info("Moving card {card} to {list}", {
+          card: args.card,
+          list: args.list,
+        });
         const [ref, lists] = await Promise.all([
           cardOnBoard(client, boardId, args.card, ctx.signal),
-          client.get<RawList[]>(`/boards/${boardId}/lists`, {
-            filter: "open",
-            fields: "name,closed,pos",
-          }, ctx.signal),
+          client.get<RawList[]>(
+            `/boards/${boardId}/lists`,
+            {
+              filter: "open",
+              fields: "name,closed,pos",
+            },
+            ctx.signal,
+            Shapes.lists,
+          ),
         ]);
         const target = resolveList(lists, args.list);
         const from = lists.find((l) => l.id === ref.idList);
@@ -1075,6 +1306,7 @@ export const model = {
               memberCreator_fields: "username",
             },
             ctx.signal,
+            Shapes.comments,
           );
           action = comments.find((c) => c.data.text.includes(marker));
           if (!action && comments.length >= MAX_ACTIONS) {
@@ -1090,7 +1322,13 @@ export const model = {
           `/cards/${ref.id}/actions/comments`,
           { text: args.text },
           ctx.signal,
+          Shapes.comment,
         );
+        ctx.logger.info("{action} comment {id} on card {card}", {
+          action: existing ? "Found existing" : "Posted",
+          id: action.id,
+          card: ref.id,
+        });
         const handle = await ctx.writeResource(
           "comment",
           `comment-${action.id}`,
@@ -1163,7 +1401,13 @@ export const model = {
         // without the file if a later step fails.
         const uploaded = await client.send<
           NonNullable<RawCard["attachments"]>[number]
-        >("POST", `/cards/${ref.id}/attachments`, form, ctx.signal);
+        >(
+          "POST",
+          `/cards/${ref.id}/attachments`,
+          form,
+          ctx.signal,
+          Shapes.attachment,
+        );
         const replaced: string[] = [];
         if (args.replaceExisting) {
           const existing = await client.get<
@@ -1185,6 +1429,15 @@ export const model = {
             }
           }
         }
+        ctx.logger.info(
+          "Uploaded {name} ({bytes} bytes) to card {card}; replaced {replaced} older copy(ies)",
+          {
+            name: uploaded.name,
+            bytes: bytes.byteLength,
+            card: ref.id,
+            replaced: replaced.length,
+          },
+        );
         const handle = await ctx.writeResource(
           "upload",
           `upload-${uploaded.id}`,
@@ -1264,6 +1517,14 @@ export const model = {
           current.delete(l.id);
           removed.push(labelText(l));
         }
+        ctx.logger.info(
+          "Card {card} labels: added {added}, removed {removed}",
+          {
+            card: ref.id,
+            added: added.join(", ") || "none",
+            removed: removed.join(", ") || "none",
+          },
+        );
         const byId = new Map(boardLabels.map((l) => [l.id, l]));
         const handle = await ctx.writeResource("labels", `labels-${ref.id}`, {
           cardId: ref.id,
@@ -1335,6 +1596,15 @@ export const model = {
             pos: "bottom",
           }, ctx.signal);
         }
+        ctx.logger.info(
+          "Checklist {checklist} on card {card}: added {added} item(s), skipped {skipped}",
+          {
+            checklist: target.name,
+            card: ref.id,
+            added: items.length,
+            skipped: args.items.length - items.length,
+          },
+        );
         const snapshot = await checklistSnapshot(
           client,
           ref.id,
@@ -1372,7 +1642,13 @@ export const model = {
           `/cards/${ref.id}/checkItem/${args.item}`,
           { state: args.state },
           ctx.signal,
+          Shapes.checkItem,
         );
+        ctx.logger.info("Set item {item} on card {card} to {state}", {
+          item: args.item,
+          card: ref.id,
+          state: args.state,
+        });
         const snapshot = await checklistSnapshot(
           client,
           ref.id,
@@ -1410,19 +1686,34 @@ export const model = {
           memberCreator_fields: "username",
         };
         if (args.since) params.since = args.since;
+        ctx.logger.info("Reading activity on card {card} ({types})", {
+          card: args.card,
+          types: args.types.join(", "),
+        });
         const [card, raw] = await Promise.all([
-          client.get<{ id: string }>(`/cards/${args.card}`, {
-            fields: "id",
-          }, ctx.signal),
+          client.get<{ id: string }>(
+            `/cards/${args.card}`,
+            {
+              fields: "id",
+            },
+            ctx.signal,
+            Shapes.id,
+          ),
           client.get<RawAction[]>(
             `/cards/${args.card}/actions`,
             params,
             ctx.signal,
+            Shapes.actions,
           ),
         ]);
         const cardId = card.id;
         const actions = raw.map(toCardAction)
           .sort((a, b) => a.date.localeCompare(b.date));
+        ctx.logger.info("Card {card}: {count} action(s){truncated}", {
+          card: cardId,
+          count: actions.length,
+          truncated: raw.length >= MAX_ACTIONS ? " (limit reached)" : "",
+        });
         const handle = await ctx.writeResource(
           "actions",
           `actions-${cardId}`,

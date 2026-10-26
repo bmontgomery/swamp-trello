@@ -11,14 +11,19 @@ import {
   fetchCardDetail,
   type FetchFn,
   isTrelloHost,
+  MAX_RETRY_DELAY_MS,
   missingItems,
   model,
   resolveLabel,
   resolveList,
   resolveMember,
+  retryDelayMs,
+  Shapes,
+  sleep,
   toCardAction,
   toCardDetail,
   TrelloClient,
+  TrelloError,
 } from "./trello.ts";
 
 const lists = [
@@ -694,4 +699,99 @@ Deno.test("apiUrl accepts plain ids and rejects path tricks", () => {
   ) {
     assertThrows(() => apiUrl(bad), Error, "Invalid Trello id");
   }
+});
+
+// ---- retries and response checks ----
+
+const fast = { "Retry-After": "0.01" };
+
+Deno.test("reads and updates retry on 5xx and network errors, and report each retry", async () => {
+  for (const method of ["GET", "PUT"] as const) {
+    let n = 0;
+    const stub: FetchFn = () => {
+      n++;
+      if (n === 1) return Promise.reject(new TypeError("connection reset"));
+      if (n === 2) {
+        return Promise.resolve(
+          new Response("", { status: 503, headers: fast }),
+        );
+      }
+      return Promise.resolve(jsonResponse({ id: "x" }));
+    };
+    const retries: string[] = [];
+    const client = new TrelloClient(
+      "k",
+      "t",
+      stub,
+      3,
+      (r) => retries.push(r.reason),
+    );
+    if (method === "GET") await client.get("/cards/abc");
+    else await client.send("PUT", "/cards/abc", { idList: "l2" });
+    assertEquals(retries, ["network error: connection reset", "HTTP 503"]);
+  }
+});
+
+Deno.test("creates are retried only on 429, never after a 5xx or a network error", async () => {
+  let calls = 0;
+  const unavailable: FetchFn = () => {
+    calls++;
+    return Promise.resolve(
+      new Response("busy", { status: 503, headers: fast }),
+    );
+  };
+  const error = await assertRejects(
+    () =>
+      new TrelloClient("k", "t", unavailable).send(
+        "POST",
+        "/cards/abc/actions/comments",
+        {
+          text: "hi",
+        },
+      ),
+    TrelloError,
+  );
+  assertEquals(error.status, 503);
+  assertEquals(calls, 1);
+
+  calls = 0;
+  const offline: FetchFn = () => {
+    calls++;
+    return Promise.reject(new TypeError("offline"));
+  };
+  await assertRejects(
+    () =>
+      new TrelloClient("k", "t", offline).send("POST", "/cards/abc/idLabels"),
+    TrelloError,
+    "network error: offline",
+  );
+  assertEquals(calls, 1);
+});
+
+Deno.test("retry delays honor Retry-After but are capped", () => {
+  assertEquals(retryDelayMs(0, "2"), 2000);
+  assertEquals(retryDelayMs(1, null), 2000);
+  assertEquals(retryDelayMs(0, "86400"), MAX_RETRY_DELAY_MS);
+});
+
+Deno.test("a retry wait stops as soon as the run is cancelled", async () => {
+  const controller = new AbortController();
+  const waiting = sleep(MAX_RETRY_DELAY_MS, controller.signal);
+  controller.abort(new Error("cancelled"));
+  await assertRejects(() => waiting, Error, "cancelled");
+});
+
+Deno.test("an unexpected response shape fails with the field that is wrong", async () => {
+  const stub: FetchFn = () => Promise.resolve(jsonResponse([{ id: 1 }]));
+  await assertRejects(
+    () =>
+      new TrelloClient("k", "t", stub).get(
+        "/boards/b/lists",
+        {},
+        undefined,
+        Shapes.lists,
+      ),
+    TrelloError,
+    "unexpected response: 0.id",
+  );
 });

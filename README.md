@@ -101,7 +101,14 @@ data.latest("my-board", "card-<cardId>").attributes.comments
   commented, attached a file, or ticked a checklist item, but **not** label
   changes. If you need to know who approved something, use a checklist item
   or a comment as the signal rather than a label.
-- HTTP 429 responses are retried with `Retry-After` / exponential backoff.
+- Reads, updates, and deletes are retried on HTTP 429, 5xx, and network
+  errors, honoring `Retry-After` (capped at 60 seconds) or backing off
+  exponentially; each retry is logged as a warning. Creates (comments,
+  uploads, labels, checklist items) are retried only on 429, so a retry never
+  creates twice.
+- Responses are checked for the fields the extension relies on; an unexpected
+  shape fails with the field that was wrong.
+- Card, list, and item ids must be plain Trello ids or short links.
 - A lane name that matches no list fails with the board's list names, so a
   typo can't silently return zero cards.
 
