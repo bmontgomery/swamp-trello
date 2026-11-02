@@ -795,3 +795,127 @@ Deno.test("an unexpected response shape fails with the field that is wrong", asy
     "unexpected response: 0.id",
   );
 });
+
+const boardPeople = {
+  "GET /boards/B/members": () => [{ id: "m1", username: "example-bot" }],
+  "GET /boards/B/labels": () => [
+    { id: "lb1", name: "Bug", color: "red" },
+    { id: "lb2", name: "Feature", color: "green" },
+  ],
+};
+
+Deno.test("createCard posts list, members, and labels by id and records the ref", async () => {
+  await withFakeTrello({
+    ...boardLists,
+    ...boardPeople,
+    "GET /boards/B/cards": () => [],
+    "POST /cards": (call) => {
+      const body = call.body as URLSearchParams;
+      return {
+        id: "new1",
+        shortLink: "abc",
+        name: body.get("name"),
+        url: "https://trello.com/c/abc",
+        idList: body.get("idList"),
+        idMembers: body.get("idMembers")!.split(","),
+      };
+    },
+  }, async (calls) => {
+    const { ctx, written } = fakeCtx();
+    await methods.createCard.execute({
+      list: "ready for development",
+      name: "Fix the crash",
+      desc: "Details\n\n`marker:1`",
+      members: ["@example-bot"],
+      labels: ["bug"],
+      position: "top",
+      skipIfDescContains: "marker:1",
+      ref: "issue-1",
+    }, ctx);
+    const post = calls.find((c) => c.method === "POST")!;
+    const body = post.body as URLSearchParams;
+    assertEquals(body.get("idList"), "ready");
+    assertEquals(body.get("idMembers"), "m1");
+    assertEquals(body.get("idLabels"), "lb1");
+    assertEquals(body.get("pos"), "top");
+    assertEquals(written[0].spec, "created");
+    assertEquals(written[0].name, "created-issue-1");
+    assertEquals(written[0].data.existing, false);
+    assertEquals(written[0].data.listName, "Ready for Development");
+  });
+});
+
+Deno.test("createCard with skipIfDescContains returns the open card that has the marker", async () => {
+  await withFakeTrello({
+    ...boardLists,
+    ...boardPeople,
+    "GET /boards/B/cards": () => [
+      {
+        id: "old1",
+        shortLink: "xyz",
+        name: "Fix the crash",
+        desc: "moved along `marker:1`",
+        url: "https://trello.com/c/xyz",
+        idList: "wip",
+        idMembers: ["m1"],
+        labels: [{ name: "Bug", color: "red" }],
+      },
+    ],
+  }, async (calls) => {
+    const { ctx, written } = fakeCtx();
+    await methods.createCard.execute({
+      list: "Ready for Development",
+      name: "Fix the crash",
+      desc: "`marker:1`",
+      members: [],
+      labels: [],
+      position: "bottom",
+      skipIfDescContains: "marker:1",
+    }, ctx);
+    assertEquals(calls.some((c) => c.method === "POST"), false);
+    assertEquals(written[0].name, "created-old1");
+    assertEquals(written[0].data.existing, true);
+    assertEquals(written[0].data.listName, "In Progress");
+  });
+});
+
+Deno.test("createCard refuses a marker that is not in the description", async () => {
+  await withFakeTrello({ ...boardLists, ...boardPeople }, async (calls) => {
+    const { ctx } = fakeCtx();
+    await assertRejects(
+      () =>
+        methods.createCard.execute({
+          list: "Ready for Development",
+          name: "x",
+          desc: "no marker here",
+          members: [],
+          labels: [],
+          position: "bottom",
+          skipIfDescContains: "marker:1",
+        }, ctx),
+      Error,
+      "must contain",
+    );
+    assertEquals(calls.length, 0);
+  });
+});
+
+Deno.test("createCard checks members and labels before creating anything", async () => {
+  await withFakeTrello({ ...boardLists, ...boardPeople }, async (calls) => {
+    const { ctx } = fakeCtx();
+    await assertRejects(
+      () =>
+        methods.createCard.execute({
+          list: "Ready for Development",
+          name: "x",
+          desc: "",
+          members: ["stranger"],
+          labels: [],
+          position: "bottom",
+        }, ctx),
+      Error,
+      "not on the board",
+    );
+    assertEquals(calls.some((c) => c.method === "POST"), false);
+  });
+});

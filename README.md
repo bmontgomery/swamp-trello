@@ -3,11 +3,10 @@
 A [swamp](https://github.com/swamp-club/swamp) extension for driving work
 through Trello boards. Watch a lane for new work, pull everything about a card
 into swamp data (description, members, labels, checklists, custom fields,
-comments, uploaded attachments, activity history), and act on cards: move
-them between lanes, comment, attach files, and manage labels and checklists.
-A typical use is a polling workflow that picks up cards assigned to a bot
-account, hands them to an automated process, and reports progress back on the
-card.
+comments, uploaded attachments, activity history), and act on cards: move them
+between lanes, comment, attach files, and manage labels and checklists. A
+typical use is a polling workflow that picks up cards assigned to a bot account,
+hands them to an automated process, and reports progress back on the card.
 
 ## Installation
 
@@ -51,25 +50,33 @@ Read:
 
 Write (each refuses cards that are not on the configured board):
 
-| Method              | Arguments                                                                               | Writes                    |
-| ------------------- | --------------------------------------------------------------------------------------- | ------------------------- |
-| `moveCard`          | `card`, `list` (id or name), `position?` (`top`/`bottom`)                               | `move-<cardId>`           |
-| `addComment`        | `card`, `text` (markdown, max 16384 chars), `skipIfContains?`                         | `comment-<actionId>`      |
-| `attachFile`        | `card`, `name`, `content` or `path`, `mimeType?` (default `text/markdown`), `replaceExisting?` | `upload-<attachmentId>`   |
-| `updateLabels`      | `card`, `add?`, `remove?` (label names or ids)                                          | `labels-<cardId>`         |
-| `addChecklistItems` | `card`, `checklist` (name; created if missing), `items`, `skipExisting?` (default true) | `checklist-<checklistId>` |
-| `setCheckItemState` | `card`, `item` (id), `state` (`complete`/`incomplete`)                                  | `checklist-<checklistId>` |
+| Method              | Arguments                                                                                      | Writes                                |
+| ------------------- | ---------------------------------------------------------------------------------------------- | ------------------------------------- |
+| `createCard`        | `list`, `name`, `desc?`, `members?`, `labels?`, `position?`, `skipIfDescContains?`, `ref?`     | `created-<ref>` or `created-<cardId>` |
+| `moveCard`          | `card`, `list` (id or name), `position?` (`top`/`bottom`)                                      | `move-<cardId>`                       |
+| `addComment`        | `card`, `text` (markdown, max 16384 chars), `skipIfContains?`                                  | `comment-<actionId>`                  |
+| `attachFile`        | `card`, `name`, `content` or `path`, `mimeType?` (default `text/markdown`), `replaceExisting?` | `upload-<attachmentId>`               |
+| `updateLabels`      | `card`, `add?`, `remove?` (label names or ids)                                                 | `labels-<cardId>`                     |
+| `addChecklistItems` | `card`, `checklist` (name; created if missing), `items`, `skipExisting?` (default true)        | `checklist-<checklistId>`             |
+| `setCheckItemState` | `card`, `item` (id), `state` (`complete`/`incomplete`)                                         | `checklist-<checklistId>`             |
 
-Writes are safe to retry where Trello allows it: moving a card to the lane it
-is already in, adding a label it already has, or adding checklist items that
+Writes are safe to retry where Trello allows it: moving a card to the lane it is
+already in, adding a label it already has, or adding checklist items that
 already exist changes nothing. `addComment` is retry-safe when you pass
 `skipIfContains`: put a unique marker in the text, and if any comment on the
-card already contains it, that comment is recorded (`existing: true`) instead
-of posting again. Trello returns at most the newest 1000 comments, so a marker
+card already contains it, that comment is recorded (`existing: true`) instead of
+posting again. Trello returns at most the newest 1000 comments, so a marker
 older than that is missed; `getCard` sets `commentsTruncated` and
 `getCardActions` sets `truncated` when that limit was reached.
-`attachFile` with `replaceExisting` uploads first and only then deletes older
-same-named attachments, so the card never loses the file mid-update.
+
+`createCard` is retry-safe the same way: put a unique marker in `desc` and pass
+it as `skipIfDescContains`. If an open card on the board already has it in its
+description, that card is recorded (`existing: true`) instead of creating a
+second one, even if it has since moved lanes. Archived cards are not checked.
+Pass `ref` to write the result under a name a workflow can predict
+(`created-<ref>`). `attachFile` with `replaceExisting` uploads first and only
+then deletes older same-named attachments, so the card never loses the file
+mid-update.
 
 Watch a lane for cards assigned to a bot, with full detail in one call:
 
@@ -93,24 +100,23 @@ data.latest("my-board", "card-<cardId>").attributes.comments
 - Credentials are sent in the `Authorization` header, never in URLs. Attachment
   downloads only go to `https://*.trello.com`; links to other sites are listed
   but not fetched.
-- Comments are returned oldest first. Each has the immutable Trello action
-  `id`, which works as a watermark for detecting new comments.
+- Comments are returned oldest first. Each has the immutable Trello action `id`,
+  which works as a watermark for detecting new comments.
 - Custom field values are resolved to their field names (dropdowns to option
   text). Some Trello plans don't offer custom fields; the list is empty then.
 - Trello's activity history (`getCardActions`) records who moved a card,
   commented, attached a file, or ticked a checklist item, but **not** label
-  changes. If you need to know who approved something, use a checklist item
-  or a comment as the signal rather than a label.
-- Reads, updates, and deletes are retried on HTTP 429, 5xx, and network
-  errors, honoring `Retry-After` (capped at 60 seconds) or backing off
-  exponentially; each retry is logged as a warning. Creates (comments,
-  uploads, labels, checklist items) are retried only on 429, so a retry never
-  creates twice.
+  changes. If you need to know who approved something, use a checklist item or a
+  comment as the signal rather than a label.
+- Reads, updates, and deletes are retried on HTTP 429, 5xx, and network errors,
+  honoring `Retry-After` (capped at 60 seconds) or backing off exponentially;
+  each retry is logged as a warning. Creates (comments, uploads, labels,
+  checklist items) are retried only on 429, so a retry never creates twice.
 - Responses are checked for the fields the extension relies on; an unexpected
   shape fails with the field that was wrong.
 - Card, list, and item ids must be plain Trello ids or short links.
-- A lane name that matches no list fails with the board's list names, so a
-  typo can't silently return zero cards.
+- A lane name that matches no list fails with the board's list names, so a typo
+  can't silently return zero cards.
 
 ## Development
 

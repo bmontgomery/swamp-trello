@@ -172,6 +172,22 @@ export const CardMoveSchema = z.object({
   movedAt: z.string(),
 });
 
+/** Result of `createCard`. `existing` is true when a matching card was found instead. */
+export const CreatedCardSchema = z.object({
+  id: z.string(),
+  shortLink: z.string(),
+  name: z.string(),
+  url: z.string(),
+  idList: z.string(),
+  listName: z.string(),
+  idMembers: z.array(z.string()),
+  labels: z.array(z.string()),
+  existing: z.boolean().describe(
+    "True when `skipIfDescContains` matched an open card and nothing was created.",
+  ),
+  createdAt: z.string(),
+});
+
 /** Result of `addComment`. */
 export const PostedCommentSchema = CommentSchema.extend({
   cardId: z.string(),
@@ -309,6 +325,26 @@ export const Shapes = {
   actions: z.array(
     z.object({ id: z.string(), type: z.string(), date: z.string() }),
   ),
+  createdCard: z.object({
+    id: z.string(),
+    shortLink: z.string(),
+    name: z.string(),
+    url: z.string(),
+    idList: z.string(),
+    idMembers: z.array(z.string()),
+  }),
+  cardDescs: z.array(z.object({
+    id: z.string(),
+    shortLink: z.string(),
+    name: z.string(),
+    desc: z.string(),
+    url: z.string(),
+    idList: z.string(),
+    idMembers: z.array(z.string()),
+    labels: z.array(
+      z.object({ name: z.string(), color: z.string().nullable() }),
+    ),
+  })),
   attachment: z.object({ id: z.string(), name: z.string() }),
   id: z.object({ id: z.string() }),
   cardRef: z.object({ id: z.string(), idBoard: z.string() }),
@@ -986,9 +1022,23 @@ const DownloadArgs = {
 /** Model definition for `@bmonty/trello`. */
 export const model = {
   type: "@bmonty/trello",
-  version: "2026.10.26.1",
+  version: "2026.11.02.1",
   globalArguments: GlobalArgsSchema,
+  upgrades: [
+    {
+      toVersion: "2026.11.02.1",
+      description: "Adds the createCard method; no schema changes",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
   resources: {
+    created: {
+      description:
+        "A card made by `createCard` (`created-<ref>`, or `created-<cardId>` without a ref)",
+      schema: CreatedCardSchema,
+      lifetime: "infinite",
+      garbageCollection: 5,
+    },
     boardLists: {
       description: "Open lists (lanes) on the board",
       schema: BoardListsSchema,
@@ -1270,6 +1320,148 @@ export const model = {
           changed,
           movedAt: new Date().toISOString(),
         });
+        return { dataHandles: [handle] };
+      },
+    },
+    createCard: {
+      description:
+        "Create a card in a lane, with members and labels; with skipIfDescContains, safe to retry",
+      arguments: z.object({
+        list: z.string().min(1).describe("Target list id or exact name."),
+        name: z.string().min(1).max(16384).describe("Card title."),
+        desc: z.string().max(16384).default("").describe(
+          "Card description; Trello renders markdown. Max 16384 characters.",
+        ),
+        members: z.array(z.string().min(1)).default([]).describe(
+          "Members to assign (username or id); each must be on the board.",
+        ),
+        labels: z.array(z.string().min(1)).default([]).describe(
+          "Board labels to add (name or id).",
+        ),
+        position: z.enum(["top", "bottom"]).default("bottom").describe(
+          "Where to place the card in the lane.",
+        ),
+        skipIfDescContains: z.string().min(1).optional().describe(
+          "Don't create if an open card on the board has this text in its description; return that card instead. Put a unique marker in `desc` and pass it here to make the call safe to retry.",
+        ),
+        ref: z.string().regex(/^[A-Za-z0-9_-]{1,100}$/).optional().describe(
+          "Write the result as `created-<ref>`, so a workflow can find it without knowing the new card's id.",
+        ),
+      }),
+      execute: async (
+        args: {
+          list: string;
+          name: string;
+          desc: string;
+          members: string[];
+          labels: string[];
+          position: "top" | "bottom";
+          skipIfDescContains?: string;
+          ref?: string;
+        },
+        ctx: MethodContext,
+      ): Promise<{ dataHandles: Array<{ name: string }> }> => {
+        if (
+          args.skipIfDescContains !== undefined &&
+          !args.desc.includes(args.skipIfDescContains)
+        ) {
+          throw new Error(
+            "`desc` must contain `skipIfDescContains`, or a retry would create the card again",
+          );
+        }
+        const client = clientFor(ctx);
+        const { boardId } = ctx.globalArgs;
+        const [lists, members, boardLabels] = await Promise.all([
+          client.get<RawList[]>(
+            `/boards/${boardId}/lists`,
+            { filter: "open", fields: "name,closed,pos" },
+            ctx.signal,
+            Shapes.lists,
+          ),
+          client.get<RawMember[]>(`/boards/${boardId}/members`, {
+            fields: "username",
+          }, ctx.signal),
+          args.labels.length
+            ? client.get<RawBoardLabel[]>(`/boards/${boardId}/labels`, {
+              fields: "name,color",
+              limit: "1000",
+            }, ctx.signal)
+            : Promise.resolve([] as RawBoardLabel[]),
+        ]);
+        const list = resolveList(lists, args.list);
+        const memberIds = args.members.map((m) => resolveMember(members, m).id);
+        const labels = args.labels.map((l) => resolveLabel(boardLabels, l));
+        const listNames = new Map(lists.map((l) => [l.id, l.name]));
+
+        let found: z.infer<typeof Shapes.cardDescs>[number] | undefined;
+        if (args.skipIfDescContains !== undefined) {
+          const marker = args.skipIfDescContains;
+          const open = await client.get<z.infer<typeof Shapes.cardDescs>>(
+            `/boards/${boardId}/cards`,
+            {
+              filter: "open",
+              fields: "shortLink,name,desc,url,idList,idMembers,labels",
+            },
+            ctx.signal,
+            Shapes.cardDescs,
+          );
+          found = open.find((c) => c.desc.includes(marker));
+        }
+
+        let result: z.infer<typeof CreatedCardSchema>;
+        if (found) {
+          result = {
+            id: found.id,
+            shortLink: found.shortLink,
+            name: found.name,
+            url: found.url,
+            idList: found.idList,
+            listName: listNames.get(found.idList) ?? "",
+            idMembers: found.idMembers,
+            labels: found.labels.map(labelText),
+            existing: true,
+            createdAt: new Date().toISOString(),
+          };
+        } else {
+          const body: Record<string, string> = {
+            idList: list.id,
+            name: args.name,
+            desc: args.desc,
+            pos: args.position,
+          };
+          if (memberIds.length) body.idMembers = memberIds.join(",");
+          if (labels.length) body.idLabels = labels.map((l) => l.id).join(",");
+          const card = await client.send<z.infer<typeof Shapes.createdCard>>(
+            "POST",
+            "/cards",
+            body,
+            ctx.signal,
+            Shapes.createdCard,
+          );
+          result = {
+            id: card.id,
+            shortLink: card.shortLink,
+            name: card.name,
+            url: card.url,
+            idList: card.idList,
+            listName: list.name,
+            idMembers: card.idMembers,
+            labels: labels.map(labelText),
+            existing: false,
+            createdAt: new Date().toISOString(),
+          };
+        }
+        ctx.logger.info('{action} card {card} "{name}" in {list}', {
+          action: found ? "Found existing" : "Created",
+          card: result.id,
+          name: result.name,
+          list: result.listName || result.idList,
+        });
+        const handle = await ctx.writeResource(
+          "created",
+          `created-${args.ref ?? result.id}`,
+          result,
+        );
         return { dataHandles: [handle] };
       },
     },
