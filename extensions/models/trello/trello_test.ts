@@ -684,6 +684,117 @@ Deno.test("addComment with skipIfContains reuses a matching comment instead of p
   });
 });
 
+const twoCards = {
+  "GET /cards/c1": () => ({
+    id: "c1",
+    idBoard: "board1",
+    idList: "ready",
+    idLabels: [],
+  }),
+  "GET /cards/c2": () => ({
+    id: "c2",
+    idBoard: "board1",
+    idList: "wip",
+    idLabels: [],
+  }),
+};
+
+Deno.test("moveCards reads the lanes once and moves each card", async () => {
+  await withFakeTrello({
+    ...board,
+    ...boardLists,
+    ...twoCards,
+    "PUT /cards/c1": () => ({}),
+  }, async (calls) => {
+    const { ctx, written } = fakeCtx();
+    const result = await methods.moveCards.execute({
+      cards: ["c1", "c2"],
+      list: "In Progress",
+      position: "top",
+    }, ctx);
+    assertEquals(
+      calls.filter((c) => c.path === "/boards/B/lists").length,
+      1,
+    );
+    assertEquals(calls.filter((c) => c.method === "PUT").length, 1);
+    assertEquals(result.dataHandles.map((h) => h.name), [
+      "move-c1",
+      "move-c2",
+    ]);
+    assertEquals(written.map((w) => w.data.changed), [true, false]);
+  });
+});
+
+Deno.test("moveCards with no cards does nothing", async () => {
+  await withFakeTrello({}, async (calls) => {
+    const { ctx, written } = fakeCtx();
+    const result = await methods.moveCards.execute({
+      cards: [],
+      list: "wip",
+      position: "top",
+    }, ctx);
+    assertEquals(calls.length, 0);
+    assertEquals(written.length, 0);
+    assertEquals(result.dataHandles, []);
+  });
+});
+
+Deno.test("addComments posts or reuses each comment", async () => {
+  await withFakeTrello({
+    ...board,
+    ...twoCards,
+    "GET /cards/c1/actions": () => [
+      { id: "a1", date: "t", idMemberCreator: "bot", data: { text: "x `m1`" } },
+    ],
+    "GET /cards/c2/actions": () => [],
+    "POST /cards/c2/actions/comments": (call) => ({
+      id: "a2",
+      date: "t",
+      idMemberCreator: "bot",
+      data: { text: (call.body as URLSearchParams).get("text") },
+    }),
+  }, async (calls) => {
+    const { ctx, written } = fakeCtx();
+    await methods.addComments.execute({
+      comments: [
+        { card: "c1", text: "deployed `m1`", skipIfContains: "m1" },
+        { card: "c2", text: "deployed `m2`", skipIfContains: "m2" },
+      ],
+    }, ctx);
+    const posts = calls.filter((c) => c.method === "POST");
+    assertEquals(posts.map((p) => p.path), ["/cards/c2/actions/comments"]);
+    assertEquals(written.map((w) => w.name), ["comment-a1", "comment-a2"]);
+    assertEquals(written.map((w) => w.data.existing), [true, false]);
+  });
+});
+
+Deno.test("addComments keeps going past a failing card, then fails naming it", async () => {
+  await withFakeTrello({
+    ...board,
+    ...twoCards,
+    "POST /cards/c2/actions/comments": () => ({
+      id: "a2",
+      date: "t",
+      idMemberCreator: "bot",
+      data: { text: "hi" },
+    }),
+  }, async () => {
+    const { ctx, written } = fakeCtx();
+    await assertRejects(
+      () =>
+        methods.addComments.execute({
+          comments: [
+            { card: "missing", text: "hi" },
+            { card: "c2", text: "hi" },
+          ],
+        }, ctx),
+      Error,
+      "Could not comment on 1 of 2 card(s): missing",
+    );
+    assertEquals(written.map((w) => w.name), ["comment-a2"]);
+  });
+});
+
 Deno.test("apiUrl accepts plain ids and rejects path tricks", () => {
   assertEquals(
     apiUrl("/cards/abc123/actions").toString(),
@@ -917,5 +1028,34 @@ Deno.test("createCard checks members and labels before creating anything", async
       "not on the board",
     );
     assertEquals(calls.some((c) => c.method === "POST"), false);
+  });
+});
+
+Deno.test("batch methods write a card listed twice only once", async () => {
+  await withFakeTrello({
+    ...board,
+    ...boardLists,
+    ...twoCards,
+    "PUT /cards/c1": () => ({}),
+    "GET /cards/c1/actions": () => [
+      { id: "a1", date: "t", idMemberCreator: "bot", data: { text: "x `m1`" } },
+    ],
+  }, async () => {
+    const moved = fakeCtx();
+    const result = await methods.moveCards.execute({
+      cards: ["c1", "c1"],
+      list: "wip",
+      position: "top",
+    }, moved.ctx);
+    assertEquals(moved.written.map((w) => w.name), ["move-c1"]);
+    assertEquals(result.dataHandles.map((h) => h.name), ["move-c1"]);
+    const commented = fakeCtx();
+    await methods.addComments.execute({
+      comments: [
+        { card: "c1", text: "a `m1`", skipIfContains: "m1" },
+        { card: "c1", text: "b `m1`", skipIfContains: "m1" },
+      ],
+    }, commented.ctx);
+    assertEquals(commented.written.map((w) => w.name), ["comment-a1"]);
   });
 });

@@ -54,11 +54,19 @@ Write (each refuses cards that are not on the configured board):
 | ------------------- | ---------------------------------------------------------------------------------------------- | ------------------------------------- |
 | `createCard`        | `list`, `name`, `desc?`, `members?`, `labels?`, `position?`, `skipIfDescContains?`, `ref?`     | `created-<ref>` or `created-<cardId>` |
 | `moveCard`          | `card`, `list` (id or name), `position?` (`top`/`bottom`)                                      | `move-<cardId>`                       |
+| `moveCards`         | `cards` (ids or short links), `list`, `position?`                                              | `move-<cardId>` per card              |
 | `addComment`        | `card`, `text` (markdown, max 16384 chars), `skipIfContains?`                                  | `comment-<actionId>`                  |
+| `addComments`       | `comments`: a list of `addComment` arguments (`card`, `text`, `skipIfContains?`)               | `comment-<actionId>` per comment      |
 | `attachFile`        | `card`, `name`, `content` or `path`, `mimeType?` (default `text/markdown`), `replaceExisting?` | `upload-<attachmentId>`               |
 | `updateLabels`      | `card`, `add?`, `remove?` (label names or ids)                                                 | `labels-<cardId>`                     |
 | `addChecklistItems` | `card`, `checklist` (name; created if missing), `items`, `skipExisting?` (default true)        | `checklist-<checklistId>`             |
 | `setCheckItemState` | `card`, `item` (id), `state` (`complete`/`incomplete`)                                         | `checklist-<checklistId>`             |
+
+`moveCards` and `addComments` handle many cards in one run. Use them instead of
+a `forEach` of `moveCard` or `addComment` steps: parallel steps against the same
+behavior wait on its lock and can time out. They work through the cards one at a
+time; if some fail, the rest still go through, the results that succeeded are
+written, and the method then fails naming each card that didn't.
 
 Writes are safe to retry where Trello allows it: moving a card to the lane it is
 already in, adding a label it already has, or adding checklist items that

@@ -1019,15 +1019,198 @@ const DownloadArgs = {
     .describe("Fail if any single attachment is larger than this."),
 };
 
+/** Most cards one batch method (`addComments`, `moveCards`) takes. */
+export const MAX_BATCH = 200;
+
+const CommentArgsSchema = z.object({
+  card: z.string().min(1).describe("Card id or short link."),
+  text: z.string().min(1).max(16384).describe(
+    "Comment text; Trello renders markdown. Max 16384 characters.",
+  ),
+  skipIfContains: z.string().min(1).optional().describe(
+    "Don't post if an existing comment contains this text; makes the call safe to retry.",
+  ),
+});
+type CommentArgs = z.infer<typeof CommentArgsSchema>;
+
+function openLists(
+  client: TrelloClient,
+  ctx: MethodContext,
+): Promise<RawList[]> {
+  return client.get<RawList[]>(
+    `/boards/${ctx.globalArgs.boardId}/lists`,
+    { filter: "open", fields: "name,closed,pos" },
+    ctx.signal,
+    Shapes.lists,
+  );
+}
+
+/** Move one card to `target` (no-op if already there) and write `move-<cardId>`. */
+async function moveOne(
+  client: TrelloClient,
+  ctx: MethodContext,
+  lists: RawList[],
+  target: RawList,
+  card: string,
+  position: "top" | "bottom",
+  write: WriteResource = (spec, name, data) =>
+    ctx.writeResource(spec, name, data),
+): Promise<{ name: string }> {
+  const ref = await cardOnBoard(
+    client,
+    ctx.globalArgs.boardId,
+    card,
+    ctx.signal,
+  );
+  const from = lists.find((l) => l.id === ref.idList);
+  const changed = ref.idList !== target.id;
+  if (changed) {
+    await client.send("PUT", `/cards/${ref.id}`, {
+      idList: target.id,
+      pos: position,
+    }, ctx.signal);
+  }
+  ctx.logger.info("Card {card}: {from} -> {to} (changed={changed})", {
+    card: ref.id,
+    from: from?.name ?? ref.idList,
+    to: target.name,
+    changed,
+  });
+  return await write("move", `move-${ref.id}`, {
+    cardId: ref.id,
+    fromListId: ref.idList,
+    fromListName: from?.name ?? "",
+    toListId: target.id,
+    toListName: target.name,
+    changed,
+    movedAt: new Date().toISOString(),
+  });
+}
+
+/** Post one comment (or find the one with the marker) and write `comment-<actionId>`. */
+async function commentOne(
+  client: TrelloClient,
+  ctx: MethodContext,
+  args: CommentArgs,
+  write: WriteResource = (spec, name, data) =>
+    ctx.writeResource(spec, name, data),
+): Promise<{ name: string }> {
+  const ref = await cardOnBoard(
+    client,
+    ctx.globalArgs.boardId,
+    args.card,
+    ctx.signal,
+  );
+  let action: RawCommentAction | undefined;
+  if (args.skipIfContains) {
+    const marker = args.skipIfContains;
+    const comments = await client.get<RawCommentAction[]>(
+      `/cards/${ref.id}/actions`,
+      {
+        filter: "commentCard",
+        limit: String(MAX_ACTIONS),
+        memberCreator_fields: "username",
+      },
+      ctx.signal,
+      Shapes.comments,
+    );
+    action = comments.find((c) => c.data.text.includes(marker));
+    if (!action && comments.length >= MAX_ACTIONS) {
+      ctx.logger.warning(
+        "Card {card} has more than {max} comments; an older comment with the marker would be missed",
+        { card: ref.id, max: MAX_ACTIONS },
+      );
+    }
+  }
+  const existing = action !== undefined;
+  action ??= await client.send<RawCommentAction>(
+    "POST",
+    `/cards/${ref.id}/actions/comments`,
+    { text: args.text },
+    ctx.signal,
+    Shapes.comment,
+  );
+  ctx.logger.info("{action} comment {id} on card {card}", {
+    action: existing ? "Found existing" : "Posted",
+    id: action.id,
+    card: ref.id,
+  });
+  return await write("comment", `comment-${action.id}`, {
+    cardId: ref.id,
+    id: action.id,
+    date: action.date,
+    authorId: action.idMemberCreator,
+    authorUsername: action.memberCreator?.username ?? null,
+    text: action.data.text,
+    existing,
+  });
+}
+
+/**
+ * Run `work` for each item, one at a time. One card failing doesn't stop the
+ * rest; the results of those that succeeded are written, then the method
+ * fails naming every card that didn't. `work` gets a `write` that writes each
+ * instance name once, so a card listed twice isn't recorded twice.
+ */
+async function eachCard<T>(
+  ctx: MethodContext,
+  verb: string,
+  items: T[],
+  cardOf: (item: T) => string,
+  work: (item: T, write: WriteResource) => Promise<{ name: string }>,
+): Promise<Array<{ name: string }>> {
+  const written = new Map<string, { name: string }>();
+  const once: WriteResource = async (spec, name, data) => {
+    const prior = written.get(name);
+    if (prior) return prior;
+    const handle = await ctx.writeResource(spec, name, data);
+    written.set(name, handle);
+    return handle;
+  };
+  const failures: string[] = [];
+  for (const item of items) {
+    if (ctx.signal?.aborted) throw ctx.signal.reason ?? new Error("Cancelled");
+    try {
+      await work(item, once);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      ctx.logger.warning("Could not {verb} card {card}: {error}", {
+        verb,
+        card: cardOf(item),
+        error: message,
+      });
+      failures.push(`${cardOf(item)}: ${message}`);
+    }
+  }
+  ctx.logger.info("Done: {done} of {count} card(s)", {
+    done: items.length - failures.length,
+    count: items.length,
+  });
+  if (failures.length > 0) {
+    throw new Error(
+      `Could not ${verb} ${failures.length} of ${items.length} card(s): ${
+        failures.join("; ")
+      }`,
+    );
+  }
+  return [...written.values()];
+}
+
 /** Model definition for `@bmonty/trello`. */
 export const model = {
   type: "@bmonty/trello",
-  version: "2026.11.02.1",
+  version: "2026.11.18.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
       toVersion: "2026.11.02.1",
       description: "Adds the createCard method; no schema changes",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.11.18.1",
+      description:
+        "Adds the addComments and moveCards batch methods; no schema changes",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -1279,48 +1462,53 @@ export const model = {
         ctx: MethodContext,
       ): Promise<{ dataHandles: Array<{ name: string }> }> => {
         const client = clientFor(ctx);
-        const { boardId } = ctx.globalArgs;
         ctx.logger.info("Moving card {card} to {list}", {
           card: args.card,
           list: args.list,
         });
-        const [ref, lists] = await Promise.all([
-          cardOnBoard(client, boardId, args.card, ctx.signal),
-          client.get<RawList[]>(
-            `/boards/${boardId}/lists`,
-            {
-              filter: "open",
-              fields: "name,closed,pos",
-            },
-            ctx.signal,
-            Shapes.lists,
-          ),
-        ]);
+        const lists = await openLists(client, ctx);
         const target = resolveList(lists, args.list);
-        const from = lists.find((l) => l.id === ref.idList);
-        const changed = ref.idList !== target.id;
-        if (changed) {
-          await client.send("PUT", `/cards/${ref.id}`, {
-            idList: target.id,
-            pos: args.position,
-          }, ctx.signal);
-        }
-        ctx.logger.info("Card {card}: {from} -> {to} (changed={changed})", {
-          card: ref.id,
-          from: from?.name ?? ref.idList,
-          to: target.name,
-          changed,
+        return {
+          dataHandles: [
+            await moveOne(client, ctx, lists, target, args.card, args.position),
+          ],
+        };
+      },
+    },
+    moveCards: {
+      description:
+        "Move several cards to one lane in a single run (each a no-op if already there)",
+      arguments: z.object({
+        cards: z.array(z.string().min(1)).max(MAX_BATCH).describe(
+          "Card ids or short links; an empty list does nothing.",
+        ),
+        list: z.string().min(1).describe("Target list id or exact name."),
+        position: z.enum(["top", "bottom"]).default("bottom").describe(
+          "Where to place each card in the target lane.",
+        ),
+      }),
+      execute: async (
+        args: { cards: string[]; list: string; position: "top" | "bottom" },
+        ctx: MethodContext,
+      ): Promise<{ dataHandles: Array<{ name: string }> }> => {
+        const client = clientFor(ctx);
+        ctx.logger.info("Moving {count} card(s) to {list}", {
+          count: args.cards.length,
+          list: args.list,
         });
-        const handle = await ctx.writeResource("move", `move-${ref.id}`, {
-          cardId: ref.id,
-          fromListId: ref.idList,
-          fromListName: from?.name ?? "",
-          toListId: target.id,
-          toListName: target.name,
-          changed,
-          movedAt: new Date().toISOString(),
-        });
-        return { dataHandles: [handle] };
+        if (args.cards.length === 0) return { dataHandles: [] };
+        const lists = await openLists(client, ctx);
+        const target = resolveList(lists, args.list);
+        return {
+          dataHandles: await eachCard(
+            ctx,
+            "move",
+            args.cards,
+            (card) => card,
+            (card, once) =>
+              moveOne(client, ctx, lists, target, card, args.position, once),
+          ),
+        };
       },
     },
     createCard: {
@@ -1467,74 +1655,39 @@ export const model = {
     },
     addComment: {
       description: "Post a comment (markdown) to a card",
+      arguments: CommentArgsSchema,
+      execute: async (
+        args: CommentArgs,
+        ctx: MethodContext,
+      ): Promise<{ dataHandles: Array<{ name: string }> }> => {
+        return { dataHandles: [await commentOne(clientFor(ctx), ctx, args)] };
+      },
+    },
+    addComments: {
+      description:
+        "Post comments to several cards in a single run; with skipIfContains, safe to retry",
       arguments: z.object({
-        card: z.string().min(1).describe("Card id or short link."),
-        text: z.string().min(1).max(16384).describe(
-          "Comment text; Trello renders markdown. Max 16384 characters.",
-        ),
-        skipIfContains: z.string().min(1).optional().describe(
-          "Don't post if an existing comment contains this text; makes the call safe to retry.",
+        comments: z.array(CommentArgsSchema).max(MAX_BATCH).describe(
+          "One entry per comment, each like `addComment`'s arguments; an empty list does nothing.",
         ),
       }),
       execute: async (
-        args: { card: string; text: string; skipIfContains?: string },
+        args: { comments: CommentArgs[] },
         ctx: MethodContext,
       ): Promise<{ dataHandles: Array<{ name: string }> }> => {
         const client = clientFor(ctx);
-        const ref = await cardOnBoard(
-          client,
-          ctx.globalArgs.boardId,
-          args.card,
-          ctx.signal,
-        );
-        let action: RawCommentAction | undefined;
-        if (args.skipIfContains) {
-          const marker = args.skipIfContains;
-          const comments = await client.get<RawCommentAction[]>(
-            `/cards/${ref.id}/actions`,
-            {
-              filter: "commentCard",
-              limit: String(MAX_ACTIONS),
-              memberCreator_fields: "username",
-            },
-            ctx.signal,
-            Shapes.comments,
-          );
-          action = comments.find((c) => c.data.text.includes(marker));
-          if (!action && comments.length >= MAX_ACTIONS) {
-            ctx.logger.warning(
-              "Card {card} has more than {max} comments; an older comment with the marker would be missed",
-              { card: ref.id, max: MAX_ACTIONS },
-            );
-          }
-        }
-        const existing = action !== undefined;
-        action ??= await client.send<RawCommentAction>(
-          "POST",
-          `/cards/${ref.id}/actions/comments`,
-          { text: args.text },
-          ctx.signal,
-          Shapes.comment,
-        );
-        ctx.logger.info("{action} comment {id} on card {card}", {
-          action: existing ? "Found existing" : "Posted",
-          id: action.id,
-          card: ref.id,
+        ctx.logger.info("Commenting on {count} card(s)", {
+          count: args.comments.length,
         });
-        const handle = await ctx.writeResource(
-          "comment",
-          `comment-${action.id}`,
-          {
-            cardId: ref.id,
-            id: action.id,
-            date: action.date,
-            authorId: action.idMemberCreator,
-            authorUsername: action.memberCreator?.username ?? null,
-            text: action.data.text,
-            existing,
-          },
-        );
-        return { dataHandles: [handle] };
+        return {
+          dataHandles: await eachCard(
+            ctx,
+            "comment on",
+            args.comments,
+            (c) => c.card,
+            (c, once) => commentOne(client, ctx, c, once),
+          ),
+        };
       },
     },
     attachFile: {
